@@ -1,3 +1,6 @@
+// replacing -r dotenv/config flag
+require("dotenv").config();
+
 const { Client, GatewayIntentBits } = require("discord.js");
 const axios = require("axios");
 
