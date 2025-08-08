@@ -1,15 +1,19 @@
 const { Client, GatewayIntentBits } = require("discord.js");
 const axios = require("axios");
 
+// --- Environment Variables ---
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const CHANNEL_ID_TO_MONITOR = process.env.TARGET_CHANNEL_ID;
 
 if (!BOT_TOKEN || !N8N_WEBHOOK_URL || !CHANNEL_ID_TO_MONITOR) {
-  console.error("Missing required environment variables!");
+  console.error(
+    "❌ Missing required environment variables! Check your .env file."
+  );
   process.exit(1);
 }
 
+// --- Discord Client Setup ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -18,47 +22,65 @@ const client = new Client({
   ],
 });
 
+// --- Queue & Processing Logic ---
 const messageQueue = [];
 const PROCESSING_INTERVAL = 5000; // 5 seconds
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 1;
+let isProcessing = false; // The "lock" to prevent race conditions
+let isShuttingDown = false; // Flag for graceful shutdown
 
 setInterval(async () => {
-  if (messageQueue.length === 0) return;
+  // Don't run if a batch is already being processed or if the queue is empty
+  if (isProcessing || messageQueue.length === 0) {
+    return;
+  }
 
-  // Take a snapshot of the queue to process, in case new messages arrive
+  // Set the lock
+  isProcessing = true;
+
+  // Take a snapshot of the queue to process
   const batchToSend = [...messageQueue];
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      await axios.post(N8N_WEBHOOK_URL, {
-        batch: batchToSend,
-        itemCount: batchToSend.length,
-      });
-
-      console.log(
-        `✅ Batch of ${batchToSend.length} messages sent successfully to n8n.`
-      );
-      // IMPORTANT: Clear the queue ONLY on success
-      messageQueue.splice(0, batchToSend.length);
-      return; // Exit the retry loop on success
-    } catch (error) {
-      console.error(
-        `❌ Attempt ${attempt}/${MAX_RETRIES} failed for batch of ${batchToSend.length} messages:`,
-        error.message
-      );
-      if (attempt === MAX_RETRIES) {
-        console.error(
-          "☠️ All retries failed. The batch will be attempted again later with new messages."
+  try {
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(
+          `🚀 Attempt ${attempt}/${MAX_RETRIES}: Sending batch of ${batchToSend.length} messages...`
         );
-      } else {
-        // Wait before retrying (e.g., exponential backoff)
-        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+
+        await axios.post(N8N_WEBHOOK_URL, {
+          batch: batchToSend,
+          itemCount: batchToSend.length,
+        });
+
+        console.log(
+          `✅ Batch of ${batchToSend.length} messages sent successfully.`
+        );
+
+        // Clear the queue ONLY on success
+        messageQueue.splice(0, batchToSend.length);
+        return; // Exit the retry loop on success
+      } catch (error) {
+        console.error(
+          `❌ Attempt ${attempt}/${MAX_RETRIES} failed:`,
+          error.message
+        );
+        if (attempt === MAX_RETRIES) {
+          console.error(
+            "☠️ All retries failed. The batch will be attempted again later."
+          );
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+        }
       }
     }
+  } finally {
+    // CRITICAL: Always release the lock, whether the request succeeded or failed.
+    isProcessing = false;
   }
 }, PROCESSING_INTERVAL);
 
-// Function to add data to the queue
+// --- Function to add data to the queue ---
 function addMessageToQueue(message) {
   const messageData = {
     content: message.content,
@@ -71,7 +93,6 @@ function addMessageToQueue(message) {
     channel: {
       id: message.channel.id,
       name: message.channel.name,
-      type: message.channel.type,
     },
     guild: message.guild
       ? { id: message.guild.id, name: message.guild.name }
@@ -96,6 +117,7 @@ function addMessageToQueue(message) {
   messageQueue.push(messageData);
 }
 
+// --- Bot Event Handlers ---
 client.on("ready", () => {
   console.log(
     `Bot online as ${client.user.tag} | Monitoring channel: ${CHANNEL_ID_TO_MONITOR}`
@@ -103,8 +125,14 @@ client.on("ready", () => {
 });
 
 client.on("messageCreate", async (message) => {
-  if (message.author.bot || message.channel.id !== CHANNEL_ID_TO_MONITOR)
+  // Ignore messages if shutting down, from other bots, or from other channels
+  if (
+    isShuttingDown ||
+    message.author.bot ||
+    message.channel.id !== CHANNEL_ID_TO_MONITOR
+  ) {
     return;
+  }
 
   try {
     addMessageToQueue(message);
@@ -118,10 +146,26 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-process.on("SIGINT", async () => {
-  console.log("\nShutting down...");
-  client.destroy();
-  process.exit();
-});
+// --- Graceful Shutdown Logic ---
+async function gracefulShutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
 
+  console.log("\n🛑 Shutting down... waiting for message queue to clear.");
+
+  // Wait until the queue is empty
+  while (messageQueue.length > 0) {
+    console.log(`   Waiting for ${messageQueue.length} messages to be sent...`);
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // Check every second
+  }
+
+  console.log("✅ Queue is empty. Bot is now offline.");
+  client.destroy();
+  process.exit(0);
+}
+
+process.on("SIGINT", gracefulShutdown); // Catches Ctrl+C
+process.on("SIGTERM", gracefulShutdown); // Catches `pm2 restart`
+
+// --- Login ---
 client.login(BOT_TOKEN);
